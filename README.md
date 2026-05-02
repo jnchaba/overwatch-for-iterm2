@@ -2,6 +2,8 @@
 
 A live terminal dashboard for your iTerm2 tabs. See every tab's working directory and session name at a glance, with special highlighting for [Claude Code](https://claude.ai/code) and [Codex](https://developers.openai.com/codex/) sessions.
 
+![overwatch screenshot](screenshot2.png)
+
 ## Features
 
 - **Live tab list** — shows current directory and session name for every tab across all windows
