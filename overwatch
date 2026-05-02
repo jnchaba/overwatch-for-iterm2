@@ -2,13 +2,14 @@
 """Overwatch — a live dashboard for your iTerm2 tabs.
 
 Shows current directory and session name for every tab, highlights
-Claude Code sessions, and lets you navigate, switch to, or close tabs
-without leaving the terminal.
+Claude Code and Codex sessions, and lets you navigate, switch to, or
+close tabs without leaving the terminal.
 
 Requires macOS and iTerm2. No dependencies beyond Python 3.7+ stdlib.
 """
 
 import curses
+import calendar
 import json
 import os
 import pathlib
@@ -70,27 +71,86 @@ end tell
 '''
 
 REFRESH_INTERVAL = 10
-USAGE_REFRESH_INTERVAL = 120
+USAGE_REFRESH_INTERVAL = 300
+CODEX_USAGE_REFRESH_INTERVAL = 300
+USAGE_LABEL_COL = 1
+USAGE_PCT_COL = 19
+USAGE_BAR_COL = 25
+USAGE_DETAIL_COL = 41
 
 MY_TTY = os.ttyname(0) if os.isatty(0) else ''
 HOME = str(pathlib.Path.home())
 
 
+NODE_LAUNCHERS = {'node', 'bun'}
+
+
+def process_basename(value):
+    return os.path.basename(value.strip('"')).lower()
+
+
+def add_clipped(stdscr, row, col, text, screen_width, attr=0):
+    """Draw text only when the target cell exists."""
+    if row < 0 or col < 0 or col >= screen_width - 1:
+        return
+    max_len = screen_width - col - 1
+    if max_len <= 0:
+        return
+    stdscr.addnstr(row, col, text, max_len, attr)
+
+
+def usage_row_visible(row, height):
+    return 0 <= row < height - 2
+
+
+def detect_agents_from_process(comm, args):
+    """Identify supported agents from a process command and argv."""
+    tokens = args.split()
+    first = process_basename(tokens[0]) if tokens else ''
+    second = tokens[1] if len(tokens) > 1 else ''
+    second_base = process_basename(second)
+    comm_base = process_basename(comm)
+    launch_prefix = ' '.join(tokens[:3]).lower()
+
+    agents = set()
+    if (comm_base == 'claude' or first == 'claude' or
+            (first in NODE_LAUNCHERS and second_base == 'claude') or
+            '@anthropic-ai/claude-code' in launch_prefix):
+        agents.add('claude')
+    if (comm_base == 'codex' or first == 'codex' or
+            (first in NODE_LAUNCHERS and second_base == 'codex') or
+            '@openai/codex' in launch_prefix):
+        agents.add('codex')
+    return agents
+
+
+def get_agent_ttys():
+    """Find TTYs that have known AI coding agents running on them."""
+    try:
+        result = subprocess.run(
+            ['ps', '-eo', 'tty,comm,args'],
+            capture_output=True, text=True, errors='replace', timeout=3
+        )
+        ttys = {}
+        for line in result.stdout.strip().split('\n'):
+            parts = line.split(None, 2)
+            if len(parts) >= 2:
+                tty = parts[0]
+                if tty == '??':
+                    continue
+                args = parts[2] if len(parts) > 2 else ''
+                for agent in detect_agents_from_process(parts[1], args):
+                    ttys.setdefault(f'/dev/{tty}', set()).add(agent)
+        return ttys
+    except Exception:
+        return {}
+
+
 def get_claude_ttys():
     """Find TTYs that have a 'claude' process running on them."""
     try:
-        result = subprocess.run(
-            ['ps', '-eo', 'tty,comm'],
-            capture_output=True, text=True, timeout=3
-        )
-        ttys = set()
-        for line in result.stdout.strip().split('\n'):
-            parts = line.split(None, 1)
-            if len(parts) == 2:
-                tty, comm = parts
-                if 'claude' in comm.lower():
-                    ttys.add(f'/dev/{tty}')
-        return ttys
+        return {tty for tty, agents in get_agent_ttys().items()
+                if 'claude' in agents}
     except Exception:
         return set()
 
@@ -271,6 +331,58 @@ def format_reset_time(iso_string):
         return ''
 
 
+def format_epoch_reset_time(epoch_seconds):
+    """Format epoch seconds as a reset countdown."""
+    if not epoch_seconds:
+        return ''
+    try:
+        reset_utc = datetime.fromtimestamp(epoch_seconds, timezone.utc)
+        total_seconds = int((reset_utc - datetime.now(timezone.utc)).total_seconds())
+        if total_seconds <= 0:
+            return 'now'
+        days = total_seconds // 86400
+        hours = (total_seconds % 86400) // 3600
+        minutes = (total_seconds % 3600) // 60
+        if days > 0:
+            relative = f'{days}d {hours}h'
+        elif hours > 0:
+            relative = f'{hours}h {minutes}m'
+        else:
+            relative = f'{minutes}m'
+        return f'{relative} ({format_abs_time(reset_utc.astimezone())})'
+    except Exception:
+        return ''
+
+
+def format_reset_delta(reset_dt):
+    """Format a local reset datetime as a countdown plus absolute time."""
+    try:
+        total_seconds = int((reset_dt - datetime.now()).total_seconds())
+        if total_seconds <= 0:
+            return 'now'
+        days = total_seconds // 86400
+        hours = (total_seconds % 86400) // 3600
+        minutes = (total_seconds % 3600) // 60
+        if days > 0:
+            relative = f'{days}d {hours}h'
+        elif hours > 0:
+            relative = f'{hours}h {minutes}m'
+        else:
+            relative = f'{minutes}m'
+        return f'{relative} ({format_abs_time(reset_dt)})'
+    except Exception:
+        return ''
+
+
+def next_month_start(now=None):
+    """Return local midnight on the first day of the next month."""
+    now = now or datetime.now()
+    month_start = datetime(now.year, now.month, 1)
+    if now.month == 12:
+        return month_start.replace(year=now.year + 1, month=1)
+    return month_start.replace(month=now.month + 1)
+
+
 WINDOW_HOURS = {
     'five_hour': 5,
     'seven_day': 168,
@@ -321,6 +433,7 @@ def limit_projection(key, bucket):
 
 def usage_bar(pct, width=15):
     """Return a text progress bar for the given percentage."""
+    pct = max(0, min(100, pct))
     filled = round(pct / 100 * width)
     return '\u2588' * filled + '\u2591' * (width - filled)
 
@@ -332,6 +445,162 @@ def usage_color(pct):
     if pct >= 50:
         return 3  # yellow
     return 8  # green
+
+
+def monthly_limit_projection(pct, has_limit):
+    """Return a warning string if monthly usage is on pace to hit the cap."""
+    if not has_limit or pct <= 0:
+        return None
+    if pct >= 100:
+        return ('  \u26a0 monthly limit hit', True)
+    try:
+        now = datetime.now()
+        days = calendar.monthrange(now.year, now.month)[1]
+        month_secs = days * 86400
+        elapsed_secs = ((now.day - 1) * 86400 + now.hour * 3600 +
+                        now.minute * 60 + now.second)
+        if elapsed_secs <= 0:
+            return None
+        elapsed_pct = (elapsed_secs / month_secs) * 100
+        if pct >= elapsed_pct:
+            rate = pct / elapsed_secs
+            secs_to_100 = (100 - pct) / rate
+            hit_time = now + timedelta(seconds=secs_to_100)
+            if hit_time < next_month_start(now):
+                return (f'  \u26a0 on pace to hit monthly limit '
+                        f'{format_abs_time(hit_time)}', False)
+    except Exception:
+        pass
+    return None
+
+
+def claude_extra_usage_row(usage):
+    """Return display row for Claude Code extra/monthly usage limits."""
+    if not usage:
+        return None
+    extra = usage.get('extra_usage')
+    if not isinstance(extra, dict) or not extra.get('is_enabled'):
+        return None
+
+    used = extra.get('used_credits')
+    limit = extra.get('monthly_limit')
+    pct = extra.get('utilization')
+    try:
+        if pct is None and limit:
+            pct = (float(used or 0) / float(limit)) * 100
+    except (TypeError, ValueError, ZeroDivisionError):
+        pct = None
+    pct = pct if pct is not None else 0
+
+    if limit:
+        label = 'CC Monthly Limit'
+        detail = f'  resets in {format_reset_delta(next_month_start())}'
+    else:
+        label = 'CC Extra Usage '
+        detail = ''
+
+    return {
+        'label': label,
+        'pct': pct,
+        'detail': detail,
+        'hit': bool(limit and pct >= 100),
+        'projection': monthly_limit_projection(pct, bool(limit)),
+    }
+
+
+def get_codex_oauth_token():
+    """Retrieve Codex OAuth access token from ~/.codex/auth.json."""
+    try:
+        with open(os.path.join(HOME, '.codex', 'auth.json'), 'r') as f:
+            creds = json.load(f)
+        return creds.get('tokens', {}).get('access_token')
+    except Exception:
+        return None
+
+
+def fetch_codex_usage():
+    """Fetch Codex account usage limits. Returns (dict, retry_after)."""
+    token = get_codex_oauth_token()
+    if not token:
+        return None, None
+    try:
+        req = urllib.request.Request(
+            'https://chatgpt.com/backend-api/wham/usage',
+            method='GET',
+            headers={
+                'Authorization': f'Bearer {token}',
+                'Accept': 'application/json',
+                'User-Agent': 'codex-cli/0.128.0',
+            }
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return json.loads(resp.read().decode()), None
+    except urllib.error.HTTPError as e:
+        retry = None
+        try:
+            retry = int(e.headers.get('Retry-After', ''))
+        except (ValueError, TypeError):
+            pass
+        return None, retry
+    except Exception:
+        return None, None
+
+
+def codex_usage_rows(usage):
+    """Return display rows for Codex rate-limit windows."""
+    if not usage:
+        return []
+    rate_limit = usage.get('rate_limit') or {}
+    rows = []
+    windows = [
+        ('CX 5h Limit', rate_limit.get('primary_window')),
+        ('CX 7d Limit', rate_limit.get('secondary_window')),
+    ]
+    for label, window in windows:
+        if not window:
+            continue
+        pct = window.get('used_percent')
+        if pct is None:
+            continue
+        rows.append({
+            'label': label,
+            'pct': pct,
+            'reset': format_epoch_reset_time(window.get('reset_at')),
+            'hit': bool(pct >= 100),
+            'projection': codex_limit_projection(label, window),
+        })
+    return rows
+
+
+def codex_limit_projection(label, window, limit_reached=False):
+    """Return a Codex rate-limit warning string if the current pace is risky."""
+    if not window:
+        return None
+    pct = window.get('used_percent') or 0
+    reset_at = window.get('reset_at')
+    window_secs = window.get('limit_window_seconds')
+    if not reset_at or not window_secs or pct <= 0:
+        return None
+    name = label.replace('CX ', '').replace(' Limit', '').lower()
+    if limit_reached or pct >= 100:
+        return (f'  \u26a0 Codex {name} limit hit', True)
+    try:
+        reset_utc = datetime.fromtimestamp(reset_at, timezone.utc)
+        now = datetime.now(timezone.utc)
+        secs_remaining = max(0, (reset_utc - now).total_seconds())
+        elapsed_secs = window_secs - secs_remaining
+        if elapsed_secs <= 0:
+            return None
+        elapsed_pct = (elapsed_secs / window_secs) * 100
+        if pct >= elapsed_pct:
+            rate = pct / elapsed_secs
+            secs_to_100 = (100 - pct) / rate
+            hit_time = now + timedelta(seconds=secs_to_100)
+            return (f'  \u26a0 on pace to hit Codex {name} limit '
+                    f'{format_abs_time(hit_time.astimezone())}', False)
+    except Exception:
+        pass
+    return None
 
 
 def main(stdscr):
@@ -347,14 +616,21 @@ def main(stdscr):
     curses.init_pair(7, curses.COLOR_WHITE, curses.COLOR_MAGENTA)  # selected claude
     curses.init_pair(8, curses.COLOR_GREEN, -1)                    # overwatch badge
     curses.init_pair(9, curses.COLOR_YELLOW, -1)                   # user labels
+    curses.init_pair(10, curses.COLOR_BLUE, -1)                    # codex tabs
+    curses.init_pair(11, curses.COLOR_WHITE, curses.COLOR_BLUE)    # selected codex
     stdscr.nodelay(True)
     stdscr.timeout(200)
 
     last_fetch = 0
     last_usage_fetch = 0
+    last_codex_usage_fetch = 0
     usage_interval = USAGE_REFRESH_INTERVAL
+    codex_usage_interval = CODEX_USAGE_REFRESH_INTERVAL
     tabs = []
     claude_ttys = set()
+    codex_ttys = set()
+    codex_usage_data = None
+    codex_usage_fetch_ok = True
     usage_data = None
     usage_fetch_ok = True
     selected = 0
@@ -369,12 +645,16 @@ def main(stdscr):
         now = time.time()
         if now - last_fetch >= REFRESH_INTERVAL or last_fetch == 0:
             tabs = fill_missing_paths(fetch_tabs())
-            claude_ttys = get_claude_ttys()
+            agent_ttys = get_agent_ttys()
+            claude_ttys = {tty for tty, agents in agent_ttys.items()
+                           if 'claude' in agents}
+            codex_ttys = {tty for tty, agents in agent_ttys.items()
+                          if 'codex' in agents}
             last_fetch = now
             if selected >= len(tabs):
                 selected = max(0, len(tabs) - 1)
 
-        # Fetch usage when Claude Code is running (once per minute)
+        # Fetch usage when Claude Code is running.
         has_claude = bool(claude_ttys)
         if has_claude and (now - last_usage_fetch >= usage_interval
                           or last_usage_fetch == 0):
@@ -394,6 +674,23 @@ def main(stdscr):
             usage_interval = USAGE_REFRESH_INTERVAL
             last_usage_fetch = 0
 
+        if codex_ttys and (now - last_codex_usage_fetch >= codex_usage_interval
+                           or last_codex_usage_fetch == 0):
+            fresh, retry_after = fetch_codex_usage()
+            codex_usage_fetch_ok = fresh is not None
+            if fresh is not None:
+                codex_usage_data = fresh
+                codex_usage_interval = CODEX_USAGE_REFRESH_INTERVAL
+            else:
+                codex_usage_interval = max(CODEX_USAGE_REFRESH_INTERVAL,
+                                           retry_after if retry_after else 0)
+            last_codex_usage_fetch = now
+        elif not codex_ttys:
+            codex_usage_data = None
+            codex_usage_fetch_ok = True
+            codex_usage_interval = CODEX_USAGE_REFRESH_INTERVAL
+            last_codex_usage_fetch = 0
+
         stdscr.erase()
         height, width = stdscr.getmaxyx()
 
@@ -402,14 +699,30 @@ def main(stdscr):
         usage_keys = ['five_hour', 'seven_day', 'seven_day_sonnet']
         active_keys = [k for k in usage_keys
                        if usage_data and usage_data.get(k)] if show_usage else []
+        claude_extra_row = (claude_extra_usage_row(usage_data)
+                            if show_usage else None)
         # Pre-compute projections once (used for layout and rendering)
         projections = {k: limit_projection(k, usage_data.get(k))
                        for k in active_keys} if show_usage else {}
         warning_count = sum(1 for v in projections.values() if v)
+        codex_rows = codex_usage_rows(codex_usage_data) if codex_ttys else []
+        codex_warning_count = sum(1 for item in codex_rows
+                                  if item.get('projection'))
+        claude_extra_warning_count = (1 if claude_extra_row and
+                                      claude_extra_row.get('projection') else 0)
         usage_section = len(active_keys) + warning_count
+        if claude_extra_row:
+            usage_section += 1
+            usage_section += claude_extra_warning_count
         if show_fetch_err:
             usage_section += 1  # room for the error line
-        bottom_reserved = (3 + usage_section) if usage_section > 0 else 3
+        usage_section += len(codex_rows)
+        usage_section += codex_warning_count
+        if codex_ttys and not codex_usage_fetch_ok and not codex_rows:
+            usage_section += 1
+        requested_bottom = (3 + usage_section) if usage_section > 0 else 3
+        bottom_reserved = (height if height <= 3 else
+                           min(requested_bottom, max(3, height - 3)))
 
         # Header
         title = ' OVERWATCH'
@@ -433,6 +746,7 @@ def main(stdscr):
             has_label = bool(label)
             is_selected = (i == selected)
             is_claude = tty in claude_ttys
+            is_codex = tty in codex_ttys
             is_me = (tty == MY_TTY)
 
             # Two-column prefix: type badge + tab number
@@ -440,6 +754,8 @@ def main(stdscr):
                 badge = ' >> '
             elif is_claude:
                 badge = ' CC '
+            elif is_codex:
+                badge = ' CX '
             else:
                 badge = '    '
             tab_col = f'{tab_num:>2} '
@@ -456,6 +772,8 @@ def main(stdscr):
                 stdscr.addnstr(row, 0, line, width - 1, curses.color_pair(4) | curses.A_BOLD)
             elif is_selected and is_claude:
                 stdscr.addnstr(row, 0, line, width - 1, curses.color_pair(7) | curses.A_BOLD)
+            elif is_selected and is_codex:
+                stdscr.addnstr(row, 0, line, width - 1, curses.color_pair(11) | curses.A_BOLD)
             elif is_selected:
                 stdscr.addnstr(row, 0, line, width - 1, curses.color_pair(5) | curses.A_BOLD)
             elif is_me:
@@ -471,6 +789,13 @@ def main(stdscr):
                 stdscr.addnstr(row, dir_start, f'{short:<48}', min(48, width - dir_start), curses.color_pair(6))
                 if width > name_start:
                     name_color = curses.color_pair(9) | curses.A_BOLD if has_label else curses.color_pair(6)
+                    stdscr.addnstr(row, name_start, display_name, width - name_start - 1, name_color)
+            elif is_codex:
+                stdscr.addstr(row, 0, badge, curses.color_pair(10) | curses.A_BOLD)
+                stdscr.addstr(row, 4, tab_col, curses.color_pair(3))
+                stdscr.addnstr(row, dir_start, f'{short:<48}', min(48, width - dir_start), curses.color_pair(10))
+                if width > name_start:
+                    name_color = curses.color_pair(9) | curses.A_BOLD if has_label else curses.color_pair(10)
                     stdscr.addnstr(row, name_start, display_name, width - name_start - 1, name_color)
             else:
                 stdscr.addstr(row, 0, badge, curses.A_DIM)
@@ -495,40 +820,118 @@ def main(stdscr):
             for key in active_keys:
                 bucket = usage_data.get(key) or {}
                 urow += 1
-                if urow < height - 2:
+                if usage_row_visible(urow, height):
                     pct = bucket.get('utilization') or 0
                     reset = format_reset_time(bucket.get('resets_at'))
                     bar = usage_bar(pct)
                     color = usage_color(pct)
                     ulabel = label_map[key]
 
-                    stdscr.addstr(urow, 1, ulabel, curses.color_pair(1) | curses.A_BOLD)
+                    add_clipped(stdscr, urow, USAGE_LABEL_COL, ulabel, width,
+                                curses.color_pair(1) | curses.A_BOLD)
                     pct_str = f'{pct:3.0f}%'
-                    stdscr.addstr(urow, 19, pct_str, curses.color_pair(color) | curses.A_BOLD)
-                    stdscr.addstr(urow, 25, bar, curses.color_pair(color))
+                    add_clipped(stdscr, urow, USAGE_PCT_COL, pct_str, width,
+                                curses.color_pair(color) | curses.A_BOLD)
+                    add_clipped(stdscr, urow, USAGE_BAR_COL, bar, width,
+                                curses.color_pair(color))
                     if reset:
-                        stdscr.addstr(urow, 41, f'  resets in {reset}', curses.A_DIM)
+                        add_clipped(stdscr, urow, USAGE_DETAIL_COL,
+                                    f'  resets in {reset}', width,
+                                    curses.A_DIM)
                 proj = projections.get(key)
                 if proj:
                     urow += 1
-                    if urow < height - 2:
+                    if usage_row_visible(urow, height):
                         text, is_hit = proj
                         wcolor = 4 if is_hit else 3
-                        stdscr.addnstr(urow, 0, text, width - 1,
-                                       curses.color_pair(wcolor) | curses.A_BOLD)
+                        add_clipped(stdscr, urow, 0, text, width,
+                                    curses.color_pair(wcolor) | curses.A_BOLD)
+
+        if claude_extra_row:
+            extra_row = divider_row + len(active_keys) + warning_count + 1
+            if usage_row_visible(extra_row, height):
+                pct = claude_extra_row['pct']
+                color = usage_color(pct)
+                add_clipped(stdscr, extra_row, USAGE_LABEL_COL,
+                            claude_extra_row['label'], width,
+                            curses.color_pair(1) | curses.A_BOLD)
+                pct_str = f'{pct:3.0f}%'
+                add_clipped(stdscr, extra_row, USAGE_PCT_COL, pct_str, width,
+                            curses.color_pair(color) | curses.A_BOLD)
+                add_clipped(stdscr, extra_row, USAGE_BAR_COL, usage_bar(pct),
+                            width, curses.color_pair(color))
+                detail = claude_extra_row.get('detail')
+                if detail:
+                    add_clipped(stdscr, extra_row, USAGE_DETAIL_COL, detail,
+                                width, curses.A_DIM)
+            proj = claude_extra_row.get('projection')
+            if proj:
+                extra_row += 1
+                if usage_row_visible(extra_row, height):
+                    text, is_hit = proj
+                    wcolor = 4 if is_hit else 3
+                    add_clipped(stdscr, extra_row, 0, text, width,
+                                curses.color_pair(wcolor) | curses.A_BOLD)
 
         if show_fetch_err:
+            err_row = (divider_row + 1 + len(active_keys) + warning_count +
+                       (1 if claude_extra_row else 0) +
+                       claude_extra_warning_count)
+            if usage_row_visible(err_row, height):
+                add_clipped(stdscr, err_row, 1, '  usage API fetch failed',
+                            width, curses.A_DIM)
+
+        if codex_rows:
+            urow = divider_row + len(active_keys) + warning_count
+            if claude_extra_row:
+                urow += 1
+                urow += claude_extra_warning_count
+            if show_fetch_err:
+                urow += 1
+            for item in codex_rows:
+                urow += 1
+                if usage_row_visible(urow, height):
+                    pct = item['pct']
+                    reset = item.get('reset')
+                    color = usage_color(pct)
+                    add_clipped(stdscr, urow, USAGE_LABEL_COL,
+                                f'{item["label"]:<16}', width,
+                                curses.color_pair(10) | curses.A_BOLD)
+                    pct_str = f'{pct:3.0f}%'
+                    add_clipped(stdscr, urow, USAGE_PCT_COL, pct_str, width,
+                                curses.color_pair(color) | curses.A_BOLD)
+                    add_clipped(stdscr, urow, USAGE_BAR_COL, usage_bar(pct),
+                                width, curses.color_pair(color))
+                    if reset:
+                        add_clipped(stdscr, urow, USAGE_DETAIL_COL,
+                                    f'  resets in {reset}', width,
+                                    curses.A_DIM)
+                proj = item.get('projection')
+                if proj:
+                    urow += 1
+                    if usage_row_visible(urow, height):
+                        text, is_hit = proj
+                        wcolor = 4 if is_hit else 3
+                        add_clipped(stdscr, urow, 0, text, width,
+                                    curses.color_pair(wcolor) | curses.A_BOLD)
+
+        if codex_ttys and not codex_usage_fetch_ok and not codex_rows:
             err_row = divider_row + 1 + len(active_keys) + warning_count
-            if err_row < height - 2:
-                stdscr.addstr(err_row, 1, '  usage API fetch failed', curses.A_DIM)
+            if claude_extra_row:
+                err_row += 1
+                err_row += claude_extra_warning_count
+            if show_fetch_err:
+                err_row += 1
+            if usage_row_visible(err_row, height):
+                add_clipped(stdscr, err_row, 1,
+                            '  Codex usage fetch failed', width,
+                            curses.A_DIM)
 
         # Legend
         legend_row = height - 2
         if legend_row > row:
-            stdscr.addstr(legend_row, 1, ' CC ', curses.color_pair(6) | curses.A_BOLD)
-            stdscr.addstr(legend_row, 6, 'Claude Code', curses.A_DIM)
-            stdscr.addstr(legend_row, 20, ' >> ', curses.color_pair(8) | curses.A_BOLD)
-            stdscr.addstr(legend_row, 25, 'this tab', curses.A_DIM)
+            legend = ' CC  Claude Code   CX  Codex    >>  this tab'
+            add_clipped(stdscr, legend_row, 1, legend, width, curses.A_DIM)
 
         # Footer
         footer_row = height - 1
@@ -602,6 +1005,8 @@ def main(stdscr):
             last_fetch = 0
             if now - last_usage_fetch >= 10:
                 last_usage_fetch = 0
+            if now - last_codex_usage_fetch >= 10:
+                last_codex_usage_fetch = 0
         elif key == curses.KEY_UP:
             selected = max(0, selected - 1)
         elif key == curses.KEY_DOWN:
