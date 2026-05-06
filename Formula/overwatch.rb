@@ -11,7 +11,16 @@ class Overwatch < Formula
     bin.install "overwatch"
   end
 
+  def caveats
+    <<~EOS
+      Overwatch requires Python 3.7+, provided by Xcode Command Line Tools.
+      If you don't have them installed:
+        xcode-select --install
+    EOS
+  end
+
   test do
     assert_predicate bin/"overwatch", :executable?
+    system "python3", "-c", "import py_compile; py_compile.compile('#{bin}/overwatch', doraise=True)"
   end
 end
